@@ -311,26 +311,44 @@ def _create_with_retries(
 # Few-shot examples to increase determinism without UI sliders
 EXAMPLES_TEXT = """
 EXAMPLE 1 — Banner normalize
-INPUT HTML:
-<div id="kl_banner">
-    <h2><span id="kl_banner_left"><span class="kl_mod_text">Module 1</span></span> Week 1 <span id="kl_banner_right">Overview<br /></span></h2>
-
+INPUT:
+<div id="kl_banner"><h2><span id="kl_banner_left"><span class="kl_mod_text">Module 1</span></span> Week 1 <span id="kl_banner_right">Overview</span></h2></div>
 RULES:
-- ENFORCE-CLASS: body -> class="dp-wrapper dp-flat-sections variation-2"
-- BANNER: selector="#page-banner" classes="dp-banner dp-banner--lg" style="min-height:180px;display:flex;align-items:center;"
+- HEADER-FROM: #kl_banner h2 -> <header class="dp-header"><h2 class="dp-heading"><span class="dp-header-pre"><span class="dp-header-pre-1">{MODULE-NUMBER}</span>&nbsp;</span> <span class="dp-header-title">{TITLE}</span></h2></header>
+- MODULE-NUMBER: regex "Module\s+(\d+)" -> "Module \1"
+- TITLE: "Overview and Readings"
+EXPECTED:
+<header class="dp-header"><h2 class="dp-heading"><span class="dp-header-pre"><span class="dp-header-pre-1">Module 1</span>&nbsp;</span> <span class="dp-header-title">Overview and Readings</span></h2></header>
 
-EXPECTED OUTPUT:
-<div id="dp-wrapper" class="dp-wrapper dp-flat-sections variation-2" data-header-class="dp-header dp-flat-sections variation-2" data-nav-class="container-fluid dp-link-grid dp-flat-sections variation-2 dp-fs-2">
 
-EXAMPLE 2 — Callout normalize
-INPUT HTML:
-<blockquote class="note">Remember the deadline.</blockquote>
-
+EXAMPLE 2 — Image to figure
+INPUT:
+<h3><img src="X/preview" alt="Confucius, Laozi, and the Buddha" width="235" height="505" /></h3>
+<p style="text-align:center;"><em>(Confucius Lao-tzu and Buddhist Arhat…)</em></p>
 RULES:
-- CALLOUTS-ALLOWED: info, warning, success
+- FIGURE-FROM-IMG with caption-from-next-p
+EXPECTED:
+<div class="dp-content-block" style="text-align: center;">
+  <figure class="dp-image-rounded-10 dp-image-padded dp-image-bordered dp-image-shadow" style="width:235px;">
+    <img class="dp-popup-image" src="X/preview" alt="Confucius, Laozi, and the Buddha" width="235" height="505" />
+    <figcaption>Confucius Lao-tzu and Buddhist Arhat…</figcaption>
+  </figure>
+</div>
 
-EXPECTED OUTPUT:
-<div class="dp-callout dp-callout--info">Remember the deadline.</div>
+Example 3 - Dates to Callout
+INPUT:
+<h3><span style="color:#e62429;">Our weeks typically run Tuesdays…</span></h3>
+RULES:
+- CALLOUT: detect #e62429 or schedule verbiage; title "Important Dates"; strip inline colors
+EXPECTED:
+<div class="dp-callout dp-callout-placeholder card dp-callout-position-default dp-callout-type-default dp-callout-color-dp-primary">
+  <div class="card-body">
+    <h3 class="card-title">Important Dates</h3>
+    <p class="card-text">Our weeks typically run Tuesdays…</p>
+  </div>
+</div>
+
+
 """
 
 def openai_rewrite(
