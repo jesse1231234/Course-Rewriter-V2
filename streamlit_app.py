@@ -1,13 +1,12 @@
 # streamlit_app.py
 # Canvas Course-wide HTML Rewrite (Test Instance)
 # - Admin-only Streamlit app for dry-run + bulk apply on Pages & Assignment descriptions
-# - Canvas API (test instance only), OpenAI Responses API (auto-pick newest model + retries)
+# - Canvas API (test instance), OpenAI Responses API (auto-pick newest model + retries)
 # - Iframe freeze/restore (no new iframes), NO sanitizer (write model HTML as-is)
-# - Visual PREVIEW (Original vs Proposed) using a built-in DesignPLUS-like "Shim" (CSS+JS) – no external URLs needed
+# - Visual PREVIEW (Original vs Proposed) using a built-in DesignPLUS-like "Shim" (CSS+JS)
 # - ETA during dry-run
 # - Approve All / Unapprove All bulk toggles
-# - Structured "Spec" controls for precise, deterministic transforms (banner, theme, palette, headings, callouts, buttons, tables, images)
-# - PRE/POST transform pipeline around the LLM to guarantee precision
+# - Precision Directives (micro-language) + few-shot examples for higher precision; no giant sidebar
 
 import os
 import re
@@ -125,11 +124,7 @@ def strip_new_iframes(html: str) -> str:
 
 def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80) -> str:
     """
-    Build a compact, valid-ish skeleton of the model HTML:
-    - Preserves tag hierarchy
-    - Keeps only id/class/role/aria-/data-* attributes
-    - Keeps short text only for headings/labels/summary
-    - Never mutates the parsed DOM (avoids bs4 edge cases)
+    Build a compact, valid-ish skeleton of the model HTML.
     """
     soup = BeautifulSoup(model_html or "", "html.parser")
 
@@ -199,36 +194,31 @@ def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80)
     return text
 
 def find_single_course_by_code(account, course_code: str):
-    """Return list of courses matching code (UI will disambiguate)."""
     courses = account.get_courses(search_term=course_code)
     return list(courses)
 
 def list_all_pages(course):
-    """Return [(title_or_slug, url_slug)] for all pages."""
     pages = []
     for p in course.get_pages():
         pages.append((getattr(p, "title", p.url), p.url))
     return pages
 
 def list_all_assignments(course):
-    """Return [(name, id)] for all assignments."""
     items = []
     for a in course.get_assignments():
         items.append((getattr(a, "name", f"Assignment {a.id}"), a.id))
     return items
 
 def fetch_model_item_html(course, kind: str, ident):
-    """Fetch full HTML for the selected model item."""
     if kind == "Page":
-        page = course.get_page(ident)  # ident = page.url (slug)
+        page = course.get_page(ident)  # ident = page.url
         return page.body or ""
     elif kind == "Assignment":
-        asg = course.get_assignment(int(ident))  # ident = assignment id
+        asg = course.get_assignment(int(ident))
         return asg.description or ""
     return ""
 
 def image_to_data_url(file) -> Tuple[str, str]:
-    """Accept a Streamlit UploadedFile and return (data_url, mime)."""
     if file is None:
         raise ValueError("No image provided")
     mime = file.type or "image/png"
@@ -252,7 +242,6 @@ def image_to_data_url(file) -> Tuple[str, str]:
 # ---------------------- Auto-pick newest model ----------------------
 
 def list_models(client: OpenAI):
-    """Return a list of model objects; empty list if listing isn't permitted."""
     try:
         res = client.models.list()
         data = getattr(res, "data", res)
@@ -261,10 +250,6 @@ def list_models(client: OpenAI):
         return []
 
 def latest_model_id(client: OpenAI, pattern: str, default_id: str) -> str:
-    """
-    Pick the newest model (by created timestamp) whose id matches `pattern` (regex).
-    Fallback to default_id if none match or listing isn't allowed.
-    """
     models = list_models(client)
     try:
         matches = [m for m in models if re.search(pattern, m.id)]
@@ -279,7 +264,7 @@ def latest_model_id(client: OpenAI, pattern: str, default_id: str) -> str:
 
 SYSTEM_PROMPT = (
     "You are an expert Canvas HTML editor. Preserve links, anchors/IDs, classes, and data-* attributes. "
-    "Placeholders like ⟪IFRAME:n⟫ represent protected iframes—do not add, remove, or reorder them. "
+    "Placeholders like ⟪IFRAME:n⟫ represent protected iframes—do not add or remove them. "
     "Follow the policy. Return only HTML, no explanations."
 )
 
@@ -293,11 +278,6 @@ def _create_with_retries(
     max_retries: int = 3,
     base_delay: float = 1.0,
 ):
-    """
-    Call Responses API with retries for 5xx/timeout/network errors.
-    If all retries fail, optionally try once with fallback_model (also retried).
-    Returns the response or raises the last exception.
-    """
     def _do_call(m: str):
         return client.responses.create(model=m, input=payload_input, temperature=0.2)
 
@@ -328,50 +308,72 @@ def _create_with_retries(
 
     raise last_err
 
+# Few-shot examples to increase determinism without UI sliders
+EXAMPLES_TEXT = """
+EXAMPLE 1 — Banner normalize
+INPUT HTML:
+<div id="kl_banner">
+    <h2><span id="kl_banner_left"><span class="kl_mod_text">Module 1</span></span> Week 1 <span id="kl_banner_right">Overview<br /></span></h2>
+
+RULES:
+- ENFORCE-CLASS: body -> class="dp-wrapper dp-flat-sections variation-2"
+- BANNER: selector="#page-banner" classes="dp-banner dp-banner--lg" style="min-height:180px;display:flex;align-items:center;"
+
+EXPECTED OUTPUT:
+<div id="dp-wrapper" class="dp-wrapper dp-flat-sections variation-2" data-header-class="dp-header dp-flat-sections variation-2" data-nav-class="container-fluid dp-link-grid dp-flat-sections variation-2 dp-fs-2">
+
+EXAMPLE 2 — Callout normalize
+INPUT HTML:
+<blockquote class="note">Remember the deadline.</blockquote>
+
+RULES:
+- CALLOUTS-ALLOWED: info, warning, success
+
+EXPECTED OUTPUT:
+<div class="dp-callout dp-callout--info">Remember the deadline.</div>
+"""
+
 def openai_rewrite(
     user_request: str,
     html: str,
     dt_mode: str,
-    policy_hard_rules: dict,
+    precision_directives: str,
     model_html_skeleton: Optional[str] = None,
     model_image_data_url: Optional[str] = None,
     model_text_id: str = DEFAULT_TEXT_MODEL,
     model_vision_id: str = DEFAULT_VISION_MODEL,
 ) -> str:
     """
-    Call OpenAI Responses API to rewrite the HTML.
-    If model_image_data_url is present, send a multimodal input with an image.
-    If model_html_skeleton is present, include it as a reference text block.
+    Call OpenAI Responses API to rewrite the HTML with precision directives and few-shot examples.
     """
     policy = {
         "design_tools_mode": dt_mode,
         "allow_inline_styles": True,
         "block_new_iframes": True,
         "reference_model": ("image" if model_image_data_url else "html" if model_html_skeleton else "none"),
-        "reference_usage": "Match layout/sectioning/components; do not copy literal course-specific links or text.",
-        "hard_requirements": policy_hard_rules or {}
+        "reference_usage": "Match layout/sectioning/components; do not copy literal course-specific links or text."
     }
 
     hard_rules_text = (
-        "Hard rules:\n"
-        "- Do not remove existing anchors/IDs/classes/data-* unless conflicting with required theme/classes.\n"
-        "- Do not create new iframes. Respect ⟪IFRAME:n⟫ placeholders.\n"
-        "- Enforce the provided theme/classes; adjust DesignPLUS components as permitted by policy.\n"
+        "Hard rules (follow EXACTLY; reason silently; output HTML only):\n"
+        + (precision_directives.strip() + "\n" if precision_directives.strip() else "")
+        + "- Do not remove existing anchors/IDs/classes/data-* unless conflicting with required theme/classes.\n"
+        + "- Do not create new iframes. Respect ⟪IFRAME:n⟫ placeholders.\n"
     )
 
-    text_blocks = [
+    blocks = [
         hard_rules_text,
         "Policy: " + json.dumps(policy, ensure_ascii=False),
+        "Examples:\n" + EXAMPLES_TEXT.strip(),
         f"DesignTools Mode: {dt_mode}",
-        "Rewrite goals: " + user_request,
-        "HTML to rewrite follows:",
-        html,
+        "Rewrite goals (optional): " + (user_request or ""),
     ]
     if model_html_skeleton:
-        text_blocks.insert(4, "Model HTML skeleton (follow structure/classes, not text):\n" + model_html_skeleton)
+        blocks.append("Model HTML skeleton (follow structure/classes, not text):\n" + model_html_skeleton)
+    blocks.append("HTML to rewrite follows:\n" + html)
 
     if not model_image_data_url:
-        prompt = "\n\n".join(text_blocks)
+        prompt = "\n\n".join(blocks)
         payload = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -387,13 +389,10 @@ def openai_rewrite(
     else:
         try:
             content_parts = [
-                {"type": "input_text", "text": "\n\n".join(text_blocks[:4])}
+                {"type": "input_text", "text": "\n\n".join(blocks[:-1])},
+                {"type": "input_image", "image_url": {"url": model_image_data_url}},
+                {"type": "input_text", "text": blocks[-1]},
             ]
-            if model_html_skeleton:
-                content_parts.append({"type": "input_text", "text": text_blocks[4]})
-            content_parts.append({"type": "input_image", "image_url": {"url": model_image_data_url}})
-            content_parts.append({"type": "input_text", "text": "\n".join(text_blocks[-2:])})
-
             payload = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": content_parts},
@@ -407,7 +406,7 @@ def openai_rewrite(
                 base_delay=1.0,
             )
         except Exception:
-            prompt = "\n\n".join(text_blocks) + "\n\n(Note: image reference unavailable; proceed using textual model description if any.)"
+            prompt = "\n\n".join(blocks) + "\n\n(Note: image reference unavailable; proceed using textual model description if any.)"
             payload = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -422,9 +421,9 @@ def openai_rewrite(
             )
 
     try:
-        return resp.output_text  # newer SDKs
+        return resp.output_text
     except AttributeError:
-        return resp.output[0].content[0].text  # fallback
+        return resp.output[0].content[0].text
 
 # ---------------------- Diff ----------------------
 
@@ -437,13 +436,11 @@ def html_diff(old: str, new: str) -> str:
 # ---------------------- Shim CSS/JS & preview ----------------------
 
 SHIM_CSS = """
-/* --- DesignPLUS-like Shim (approximate) --- */
 :root {
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Lato, Arial, sans-serif;
   --csu-green: #1E4D2B;
   --csu-gold: #C8C372;
   --neutral-900: #262626;
-  --neutral-100: #f5f5f5;
   --border: #e2e8f0;
 }
 html, body { margin:0; padding:0; font-family:var(--font); line-height:1.5; background:#fff; color:#111; }
@@ -453,7 +450,7 @@ p,li { font-size: 16px; }
 a { color: #005f85; text-decoration: underline; }
 img { max-width: 100%; height: auto; }
 
-/* Banner approximate */
+/* Banner */
 .dp-banner, .dpl-banner, .designplus.banner {
   border-radius: 10px; padding: 16px 20px; color: #fff;
   background: linear-gradient(135deg, var(--csu-green), #0f2a18);
@@ -485,7 +482,7 @@ img { max-width: 100%; height: auto; }
 .tab-panel { border:1px solid var(--border); border-radius:0 6px 6px 6px; padding:12px; display:none; }
 .tab-panel.active { display:block; }
 
-/* Accordions (using <details>) */
+/* Accordions */
 details { border:1px solid var(--border); border-radius:8px; padding:8px 12px; margin:10px 0; }
 details > summary { font-weight:600; cursor:pointer; }
 
@@ -500,7 +497,6 @@ table { border-collapse: collapse; width: 100%; }
 """
 
 SHIM_JS = """
-// Minimal DP-like interactions (tabs)
 (function(){
   function initTabs(root){
     const tabsets = root.querySelectorAll('.tabs');
@@ -520,7 +516,7 @@ SHIM_JS = """
 """
 
 def neutralize_iframes_for_preview(html: str) -> str:
-    """Replace iframes with a neutral placeholder (avoid external loads in preview)."""
+    """Replace iframes with placeholders (no external loads in preview)."""
     soup = BeautifulSoup(html or "", "html.parser")
     for tag in soup.find_all("iframe"):
         src = (tag.get("src") or "").strip()
@@ -530,17 +526,14 @@ def neutralize_iframes_for_preview(html: str) -> str:
         tag.replace_with(placeholder)
     return str(soup)
 
-def preview_html_document(inner_html: str, use_js_shim: bool, extra_css_inline: str = "") -> str:
-    """
-    Wrap course HTML in a minimal, sandbox-friendly page for st.components.v1.html.
-    Includes DP-like shim CSS, optional shim JS, and optional extra inline CSS.
-    """
+def preview_html_document(inner_html: str, use_js_shim: bool) -> str:
+    """Wrap content in a minimal, sandboxed page for st.components.v1.html."""
     safe_inner = inner_html or ""
     return f"""<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
-    <style>{SHIM_CSS}\n{extra_css_inline or ""}</style>
+    <style>{SHIM_CSS}</style>
   </head>
   <body>
     <main id="frame">
@@ -550,316 +543,52 @@ def preview_html_document(inner_html: str, use_js_shim: bool, extra_css_inline: 
   </body>
 </html>"""
 
-# ---------------------- Deterministic transforms (Spec) ----------------------
-
-def parse_color_to_rgb(s: str) -> Optional[Tuple[int,int,int]]:
-    s = s.strip()
-    # hex formats
-    m = re.fullmatch(r"#([0-9a-fA-F]{3,8})", s)
-    if m:
-        h = m.group(1)
-        if len(h) in (3,4):
-            r = int(h[0]*2,16); g=int(h[1]*2,16); b=int(h[2]*2,16)
-            return (r,g,b)
-        if len(h) in (6,8):
-            r = int(h[0:2],16); g=int(h[2:4],16); b=int(h[4:6],16)
-            return (r,g,b)
-    # rgb/rgba
-    m = re.fullmatch(r"rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(,\s*[\d.]+\s*)?\)", s, re.I)
-    if m:
-        return (int(float(m.group(1))), int(float(m.group(2))), int(float(m.group(3))))
-    # hsl/hlsa -> rough conversion
-    m = re.fullmatch(r"hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*(,\s*[\d.]+\s*)?\)", s, re.I)
-    if m:
-        h = float(m.group(1)) % 360
-        s2 = float(m.group(2))/100.0
-        l = float(m.group(3))/100.0
-        # convert HSL to RGB (simple)
-        c = (1 - abs(2*l - 1)) * s2
-        x = c * (1 - abs((h/60)%2 - 1))
-        m0 = l - c/2
-        r,g,b = 0,0,0
-        if 0<=h<60: r,g,b = c,x,0
-        elif 60<=h<120: r,g,b = x,c,0
-        elif 120<=h<180: r,g,b = 0,c,x
-        elif 180<=h<240: r,g,b = 0,x,c
-        elif 240<=h<300: r,g,b = x,0,c
-        else: r,g,b = c,0,x
-        return (int((r+m0)*255), int((g+m0)*255), int((b+m0)*255))
-    return None
-
-def rgb_to_hex(rgb: Tuple[int,int,int]) -> str:
-    r,g,b = rgb
-    return f"#{max(0,min(255,r)):02X}{max(0,min(255,g)):02X}{max(0,min(255,b)):02X}"
-
-def nearest_color(rgb: Tuple[int,int,int], allowed_rgbs: List[Tuple[int,int,int]]) -> Tuple[int,int,int]:
-    best = allowed_rgbs[0]
-    br,bg,bb = rgb
-    best_d = 1e9
-    for (r,g,b) in allowed_rgbs:
-        d = (r-br)**2 + (g-bg)**2 + (b-bb)**2
-        if d < best_d:
-            best_d = d
-            best = (r,g,b)
-    return best
-
-def normalize_palette(html: str, allowed: List[str], forbidden: List[str], map_strategy: str) -> str:
-    """Map/strip inline colors to conform to allowed palette."""
-    if not allowed and not forbidden:
-        return html
-    soup = BeautifulSoup(html or "", "html.parser")
-
-    allowed_set = [c.strip() for c in allowed if c.strip()]
-    allowed_rgbs = [parse_color_to_rgb(c) for c in allowed_set if parse_color_to_rgb(c)]
-    forbidden_set = set(c.strip().lower() for c in forbidden if c.strip())
-
-    def fix_style_value(style_value: str) -> str:
-        # Replace colors in common CSS props
-        def repl_color(match):
-            color_str = match.group(0)
-            lower = color_str.lower()
-            if lower in forbidden_set:
-                return "" if map_strategy in ("strip","exact") else allowed_set[0] if allowed_set else color_str
-            rgb = parse_color_to_rgb(color_str)
-            if not rgb:
-                return color_str
-            hexv = rgb_to_hex(rgb)
-            if map_strategy == "exact" and hexv.upper() not in [a.upper() for a in allowed_set]:
-                return ""  # strip declaration value; caller keeps property syntax simple
-            if map_strategy == "nearest" and allowed_rgbs:
-                nrgb = nearest_color(rgb, allowed_rgbs)
-                return rgb_to_hex(nrgb)
-            if map_strategy == "strip":
-                return ""
-            return color_str
-
-        # naive find colors
-        style_value = re.sub(r"#(?:[0-9a-fA-F]{3,8})\b", repl_color, style_value)
-        style_value = re.sub(r"rgba?\([^)]+\)", repl_color, style_value)
-        style_value = re.sub(r"hsla?\([^)]+\)", repl_color, style_value)
-        return style_value
-
-    for el in soup.find_all(True):
-        # legacy attributes
-        if el.has_attr("color"):
-            c = el["color"]
-            rgb = parse_color_to_rgb(c) or parse_color_to_rgb("#"+c if not c.startswith("#") else c)
-            if rgb:
-                if map_strategy == "nearest" and allowed_rgbs:
-                    el["color"] = rgb_to_hex(nearest_color(rgb, allowed_rgbs))
-                elif map_strategy in ("strip","exact") and rgb_to_hex(rgb).upper() not in [a.upper() for a in allowed_set]:
-                    del el["color"]
-        if el.has_attr("bgcolor"):
-            c = el["bgcolor"]
-            rgb = parse_color_to_rgb(c) or parse_color_to_rgb("#"+c if not c.startswith("#") else c)
-            if rgb:
-                if map_strategy == "nearest" and allowed_rgbs:
-                    el["bgcolor"] = rgb_to_hex(nearest_color(rgb, allowed_rgbs))
-                elif map_strategy in ("strip","exact") and rgb_to_hex(rgb).upper() not in [a.upper() for a in allowed_set]:
-                    del el["bgcolor"]
-
-        # inline styles
-        if el.has_attr("style"):
-            fixed = fix_style_value(el["style"])
-            # Clean up potential empty declarations like "color: ;"
-            fixed = re.sub(r";?\s*(color|background(?:-color)?|border-color)\s*:\s*(;|$)", ";", fixed)
-            el["style"] = fixed.strip(" ;")
-
-    return str(soup)
-
-def enforce_theme_class(html: str, theme_class: str, container_selector: str = "body") -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
-    target = soup.select_one(container_selector) or soup
-    classes = set((target.get("class") or []))
-    if theme_class:
-        classes.add(theme_class)
-        target["class"] = list(classes)
-    return str(soup)
-
-def normalize_headings(html: str, min_h: int = 2, enforce_hierarchy: bool = True) -> str:
-    """Ensure headings start from min_h and no jumps in level."""
-    soup = BeautifulSoup(html or "", "html.parser")
-    current_level = min_h - 1
-    for h in soup.find_all(re.compile(r"^h[1-6]$", re.I)):
-        level = int(h.name[1])
-        if level < min_h:
-            level = min_h
-        if enforce_hierarchy:
-            level = max(level, min(current_level + 1, 6))
-            current_level = level
-        h.name = f"h{level}"
-    return str(soup)
-
-def normalize_callouts(html: str, allowed_variants: List[str]) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
-    allowed = set(allowed_variants or [])
-    for el in soup.find_all(True):
-        cls = " ".join(el.get("class", []))
-        if "callout" in cls or "dp-callout" in cls or "dpl-callout" in cls:
-            # coerce to first allowed if none detected
-            found = None
-            for v in allowed:
-                if v in cls:
-                    found = v
-                    break
-            variant = found or (list(allowed)[0] if allowed else "info")
-            # normalize classes
-            classes = [c for c in el.get("class", []) if not c.startswith("dp-callout--")]
-            classes = list(dict.fromkeys(classes + ["dp-callout", f"dp-callout--{variant}"]))
-            el["class"] = classes
-    return str(soup)
-
-def upgrade_buttons_and_links(html: str, button_class: str) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
-    for a in soup.find_all("a"):
-        cl = a.get("class", [])
-        style = a.get("style", "")
-        looks_button = ("button" in " ".join(cl).lower()) or ("background" in style and "padding" in style)
-        if looks_button and button_class.strip():
-            merged = list(dict.fromkeys(cl + button_class.split()))
-            a["class"] = merged
-        href = a.get("href", "")
-        if href.startswith("http"):
-            # ensure noopener without forcing noreferrer if you don't want it
-            rel = set((a.get("rel") or []))
-            rel.add("noopener")
-            a["rel"] = list(rel)
-    return str(soup)
-
-def normalize_tables(html: str, table_class: str = "ic-Table", zebra: bool = True) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
-    for t in soup.find_all("table"):
-        classes = set(t.get("class", []))
-        classes.add(table_class)
-        if zebra:
-            classes.add("zebra")
-        t["class"] = list(classes)
-        # add scope to th
-        for th in t.find_all("th"):
-            if not th.has_attr("scope"):
-                th["scope"] = "col"
-    return str(soup)
-
-def ensure_images(html: str, max_width: str = "100%", require_alt: bool = True) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
-    for img in soup.find_all("img"):
-        if max_width:
-            style = img.get("style", "")
-            if "max-width" not in style:
-                img["style"] = (style + f";max-width:{max_width}").strip(";")
-        if require_alt and not img.get("alt"):
-            img["alt"] = "Image"
-    return str(soup)
-
-def transform_banner(html: str, selector: str, classes: str, style: str, inner_html: Optional[str], insert_if_missing: bool) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
-    target = soup.select_one(selector) if selector else None
-    if not target and insert_if_missing:
-        new_div = soup.new_tag("div")
-        if classes.strip():
-            new_div["class"] = classes.split()
-        if style.strip():
-            new_div["style"] = style
-        if inner_html and inner_html.strip():
-            frag = BeautifulSoup(inner_html, "html.parser")
-            # append children to new_div
-            frag_root = frag.body or frag
-            for c in list(frag_root.children):
-                new_div.append(c if isinstance(c, Tag) else NavigableString(str(c)))
-        # insert at top
-        if soup.body:
-            soup.body.insert(0, new_div)
-        else:
-            soup.insert(0, new_div)
-        return str(soup)
-
-    if target:
-        if classes.strip():
-            target["class"] = list(set((target.get("class") or []) + classes.split()))
-        if style.strip():
-            existing = target.get("style", "")
-            target["style"] = (existing + ";" + style).strip(";")
-        if inner_html and inner_html.strip():
-            target.clear()
-            frag = BeautifulSoup(inner_html, "html.parser")
-            frag_root = frag.body or frag
-            for c in list(frag_root.children):
-                target.append(c if isinstance(c, Tag) else NavigableString(str(c)))
-    return str(soup)
-
-def apply_pre_transforms(html: str, spec: dict) -> str:
-    # Minimal structural enforcement before LLM
-    out = html
-    # Theme on root/body
-    theme_class = spec.get("theme", {}).get("designplus_class") or ""
-    if theme_class:
-        out = enforce_theme_class(out, theme_class, "body")
-    # Banner
-    b = spec.get("banner", {})
-    if b:
-        out = transform_banner(
-            out,
-            selector=b.get("selector") or "#page-banner, .dp-banner, .dpl-banner, .designplus.banner",
-            classes=b.get("classes") or "",
-            style=b.get("style") or "",
-            inner_html=b.get("inner_html"),
-            insert_if_missing=bool(b.get("insert_if_missing", True)),
-        )
-    # Headings
-    ty = spec.get("typography", {})
-    out = normalize_headings(out, min_h=int(ty.get("min_h", 2)), enforce_hierarchy=bool(ty.get("enforce_hierarchy", True)))
-    return out
-
-def apply_post_transforms(html: str, spec: dict) -> str:
-    out = html
-    # Palette/colors
-    pal = spec.get("palette", {})
-    out = normalize_palette(
-        out,
-        allowed=pal.get("allowed", []),
-        forbidden=pal.get("forbidden", []),
-        map_strategy=pal.get("map_strategy", "nearest"),
-    )
-    # Theme enforce again
-    theme_class = spec.get("theme", {}).get("designplus_class") or ""
-    if theme_class:
-        out = enforce_theme_class(out, theme_class, "body")
-    # Callouts
-    comp = spec.get("components", {})
-    out = normalize_callouts(out, allowed_variants=comp.get("callouts_allowed", ["info","warning","success"]))
-    # Buttons & links
-    btn = spec.get("buttons", {})
-    out = upgrade_buttons_and_links(out, button_class=btn.get("primary_class", "dpl-button dpl-button--primary"))
-    # Tables
-    tbl = spec.get("tables", {})
-    out = normalize_tables(out, table_class=tbl.get("class", "ic-Table"), zebra=bool(tbl.get("zebra", True)))
-    # Images
-    img = spec.get("images", {})
-    out = ensure_images(out, max_width=img.get("max_width", "100%"), require_alt=bool(img.get("require_alt", True)))
-    return out
-
 # ---------------------- UI ----------------------
 
 st.title("Canvas Course-wide HTML Rewrite (Test Instance)")
 
 with st.sidebar:
-    st.header("Rewrite Configuration")
-    dt_mode = st.selectbox("DesignTools Mode", DT_MODES, index=1)
+    st.header("Rewrite Setup")
+
+    dt_mode = st.selectbox("DesignTools Mode", DT_MODES, index=1, help="How aggressively to use/change DesignTools patterns.")
     user_request = st.text_area(
-        "Rewrite goals (your instructions)",
-        value="Normalize headings to start at h2; improve accessibility; preserve link destinations; "
-              "convert or enhance DesignTools components as needed; keep existing iframes unchanged.",
-        height=140,
-        help="Describe exactly what to change across the course."
+        "Rewrite goals (optional, in plain English)",
+        value="Improve accessibility; normalize headings; refine layout using DesignPLUS where appropriate; preserve links and existing iframes.",
+        height=120,
     )
+
+    st.markdown("**Precision directives (optional, power users)**")
+    precision_directives = st.text_area(
+        label="",
+        value=(
+            "PRESERVE: anchors, ids, classes, data-*\n"
+            "NO-NEW: iframes\n"
+            "ENFORCE-CLASS: body -> dp-theme--flat-sections variation-2\n"
+            "BANNER: selector=\"#page-banner,.dp-banner\" classes=\"dp-banner dp-banner--lg\" style=\"min-height:180px;display:flex;align-items:center;\" insert-if-missing=true\n"
+            "PALETTE-ALLOWED: #1E4D2B, #D9782D, #C9D845, #CC5430, #105456, #FFFFFF, #262626\n"
+            "PALETTE-MAP: nearest\n"
+            "CALLOUTS-ALLOWED: info, warning, success\n"
+            "TABS: allow\n"
+            "ACCORDIONS: auto\n"
+            "HEADINGS: min=2, enforce-hierarchy=true\n"
+            "BUTTON-CLASS: dpl-button dpl-button--primary\n"
+            "TABLE: class=ic-Table, zebra=true\n"
+            "IMAGES: max-width=100%, alt=require\n"
+            "DO-NOT-EDIT: \"#course-links, .lti-embed, .assignment-group\""
+        ),
+        height=170,
+        help="Short command-style rules. Leave as-is or tweak."
+    )
+
+    with st.expander("Preview options"):
+        PREVIEW_HEIGHT = st.slider("Preview height (px)", 320, 1200, 520, 20)
+        PREVIEW_JS = st.checkbox("Enable shim JS (tabs interactions)", value=True)
 
     st.markdown("---")
     st.subheader("Model")
-    mode = st.radio("Selection", ["Auto (latest)", "Manual"], horizontal=True)
+    mode = st.radio("Model selection", ["Auto (latest)", "Manual"], horizontal=True)
     if mode == "Auto (latest)":
-        # Prefer newest gpt-5 for text; fallback to 4.1/4o as needed
         MODEL_TEXT = latest_model_id(openai_client, r"^(gpt-5|gpt-4\.1|gpt-4o|o\d)", DEFAULT_TEXT_MODEL)
-        # Prefer newest gpt-5 or gpt-4o for vision
         MODEL_VISION = latest_model_id(openai_client, r"^(gpt-5|gpt-4o|gpt-4\.1|o\d)", DEFAULT_VISION_MODEL)
     else:
         MODEL_TEXT = st.text_input("Text model id", value=DEFAULT_TEXT_MODEL)
@@ -867,101 +596,26 @@ with st.sidebar:
     st.caption(f"Using text model: {MODEL_TEXT}")
     st.caption(f"Using vision model: {MODEL_VISION}")
 
-    with st.expander("Advanced (prompt size & retries)"):
-        MAX_INPUT_CHARS = st.number_input(
-            "Max item HTML chars sent to model",
-            min_value=5000, max_value=200000, value=40000, step=5000
-        )
-        MAX_MODEL_SKELETON_CHARS = st.number_input(
-            "Max model skeleton chars",
-            min_value=5000, max_value=200000, value=60000, step=5000
-        )
-
-    st.markdown("---")
-    st.subheader("Spec (deterministic controls)")
-    # CSU palette defaults
-    default_allowed = ["#1E4D2B", "#C8C372", "#FFFFFF", "#262626"]
-    palette_allowed = st.text_input("Allowed colors (comma-separated hex)", value=", ".join(default_allowed))
-    palette_forbidden = st.text_input("Forbidden colors (comma-separated hex)", value="")
-    map_strategy = st.radio("Color mapping", ["nearest", "exact", "strip"], index=0, horizontal=True)
-
-    theme_choice = st.selectbox("DesignPLUS theme", ["Circle Left 1", "Custom"], index=0)
-    theme_class = st.text_input("Theme class to enforce", value="dp-theme--circle-left-1" if theme_choice=="Circle Left 1" else "")
-
-    with st.expander("Banner (precise)"):
-        USE_BANNER_SPEC = st.checkbox("Apply banner transform", value=True)
-        BANNER_SELECTOR = st.text_input("Banner container selector", value="#page-banner, .dp-banner, .dpl-banner, .designplus.banner")
-        BANNER_CLASSES = st.text_input("Banner classes", value="dp-banner dp-banner--lg")
-        BANNER_STYLE = st.text_input("Banner inline style", value="min-height: 180px; display:flex; align-items:center;")
-        BANNER_INNER_HTML = st.text_area("Banner inner HTML (optional)", value="<h2 class='sr-only'>Course Banner</h2>", height=80)
-        INSERT_IF_MISSING = st.checkbox("Insert banner at top if missing", value=True)
-
-    with st.expander("Components & Typography"):
-        callouts_allowed = st.multiselect("Callout variants allowed", ["info","warning","success","note"], default=["info","warning","success"])
-        tabs_policy = st.radio("Tabs", ["forbid","allow","auto"], index=2, horizontal=True)
-        accordions_policy = st.radio("Accordions", ["forbid","allow","auto"], index=2, horizontal=True)
-        min_h = st.number_input("Minimum heading level", min_value=2, max_value=4, value=2, step=1)
-        enforce_hierarchy = st.checkbox("Enforce heading hierarchy (no jumps)", value=True)
-
-    with st.expander("Buttons, Tables, Images"):
-        btn_primary = st.text_input("Button primary class", value="dpl-button dpl-button--primary")
-        tbl_class = st.text_input("Table class", value="ic-Table")
-        tbl_zebra = st.checkbox("Zebra striping", value=True)
-        img_max_w = st.text_input("Image max width", value="100%")
-        img_require_alt = st.checkbox("Require alt text", value=True)
-
-    # Build the spec dict to pass to transforms & LLM hard rules
-    SPEC = {
-        "theme": {"designplus_class": theme_class.strip()},
-        "palette": {
-            "allowed": [c.strip() for c in palette_allowed.split(",") if c.strip()],
-            "forbidden": [c.strip() for c in palette_forbidden.split(",") if c.strip()],
-            "map_strategy": map_strategy,
-        },
-        "components": {
-            "callouts_allowed": callouts_allowed,
-            "tabs": tabs_policy,
-            "accordions": accordions_policy,
-        },
-        "typography": {"min_h": int(min_h), "enforce_hierarchy": bool(enforce_hierarchy)},
-        "buttons": {"primary_class": btn_primary.strip()},
-        "tables": {"class": tbl_class.strip(), "zebra": bool(tbl_zebra)},
-        "images": {"max_width": img_max_w.strip(), "require_alt": bool(img_require_alt)},
-        "banner": {
-            "selector": BANNER_SELECTOR if USE_BANNER_SPEC else "",
-            "classes": BANNER_CLASSES if USE_BANNER_SPEC else "",
-            "style": BANNER_STYLE if USE_BANNER_SPEC else "",
-            "inner_html": BANNER_INNER_HTML if (USE_BANNER_SPEC and BANNER_INNER_HTML.strip()) else "",
-            "insert_if_missing": bool(INSERT_IF_MISSING) if USE_BANNER_SPEC else False,
-        }
-    }
-
-    st.markdown("---")
-    st.subheader("Preview options")
-    PREVIEW_HEIGHT = st.slider("Preview height (px)", 320, 1200, 520, 20)
-    PREVIEW_JS = st.checkbox("Enable shim JS (tabs interactions)", value=True)
-    st.caption("Previews use a built-in DesignPLUS-like shim. No external CSS/JS required.")
+    with st.expander("Advanced"):
+        MAX_INPUT_CHARS = st.number_input("Max item HTML chars sent to model", 5000, 200000, 40000, 5000)
+        MAX_MODEL_SKELETON_CHARS = st.number_input("Max model skeleton chars", 5000, 200000, 60000, 5000)
 
     st.markdown("---")
     st.subheader("Model Reference (optional)")
-    ref_kind = st.radio("Type", ["None", "Paste HTML", "Upload Image", "Model Course"], horizontal=True)
+    ref_kind = st.radio("Reference type", ["None", "Paste HTML", "Upload Image", "Model Course"], horizontal=True)
 
     model_html_skeleton = None
     model_image_data_url = None
 
     if ref_kind == "Paste HTML":
-        pasted_html = st.text_area(
-            "Paste model HTML here",
-            height=200,
-            help="Paste the HTML of a model Canvas page. We will derive a structure skeleton from it."
-        )
+        pasted_html = st.text_area("Paste model HTML here", height=200)
         if pasted_html.strip():
             try:
                 model_html_skeleton = html_to_skeleton(pasted_html)
                 if len(model_html_skeleton) > MAX_MODEL_SKELETON_CHARS:
                     model_html_skeleton = model_html_skeleton[:MAX_MODEL_SKELETON_CHARS] + " <!-- truncated -->"
                 st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
-                with st.expander("Preview model HTML skeleton"):
+                with st.expander("Preview model skeleton"):
                     st.code(model_html_skeleton[:4000])
             except Exception as e:
                 st.error(f"Failed to process pasted HTML: {e}")
@@ -992,7 +646,6 @@ with st.sidebar:
                 key="model_course_idx"
             )
             model_course = model_courses[m_idx]
-
             kind = st.radio("Model item type", ["Page", "Assignment"], horizontal=True, key="model_item_kind")
 
             if kind == "Page":
@@ -1011,12 +664,12 @@ with st.sidebar:
                             if len(model_html_skeleton) > MAX_MODEL_SKELETON_CHARS:
                                 model_html_skeleton = model_html_skeleton[:MAX_MODEL_SKELETON_CHARS] + " <!-- truncated -->"
                             st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
-                            with st.expander("Preview model HTML skeleton"):
+                            with st.expander("Preview model skeleton"):
                                 st.code(model_html_skeleton[:4000])
                         except Exception as e:
                             st.error(f"Failed to fetch model page: {e}")
 
-            else:  # Assignment
+            else:
                 if "model_asgs" not in st.session_state:
                     st.session_state["model_asgs"] = list_all_assignments(model_course)
                 if st.button("Refresh model assignments"):
@@ -1032,7 +685,7 @@ with st.sidebar:
                             if len(model_html_skeleton) > MAX_MODEL_SKELETON_CHARS:
                                 model_html_skeleton = model_html_skeleton[:MAX_MODEL_SKELETON_CHARS] + " <!-- truncated -->"
                             st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
-                            with st.expander("Preview model HTML skeleton"):
+                            with st.expander("Preview model skeleton"):
                                 st.code(model_html_skeleton[:4000])
                         except Exception as e:
                             st.error(f"Failed to fetch model assignment: {e}")
@@ -1053,83 +706,45 @@ if courses:
     course = courses[idx]
 
     st.subheader("2) Dry-run")
-    if st.button("Collect items & simulate rewrite", disabled=(not user_request.strip())):
-        if not user_request.strip():
-            st.warning("Please enter rewrite goals first.")
-        else:
-            st.session_state["items"] = []
-            st.session_state["drafts"] = {}
-            with st.spinner("Fetching items…"):
-                module_items = list_supported_items(course)
+    if st.button("Collect items & simulate rewrite"):
+        st.session_state["items"] = []
+        st.session_state["drafts"] = {}
+        with st.spinner("Fetching items…"):
+            module_items = list_supported_items(course)
 
-            progress = st.progress(0.0)
-            eta_box = st.empty()
-            total = max(len(module_items), 1)
-            start_time = time.time()
-            recent_durations = []
-            WINDOW = 5
+        progress = st.progress(0.0)
+        eta_box = st.empty()
+        total = max(len(module_items), 1)
+        start_time = time.time()
+        recent_durations = []
+        WINDOW = 5
 
-            for n, (module, it) in enumerate(module_items, start=1):
-                item_t0 = time.time()
-                meta = fetch_item_html(course, it)
-                original = meta["html"] or ""
-                frozen, mapping, hosts = protect_iframes(original)
+        for n, (module, it) in enumerate(module_items, start=1):
+            item_t0 = time.time()
+            meta = fetch_item_html(course, it)
+            original = meta["html"] or ""
+            frozen, mapping, hosts = protect_iframes(original)
 
-                # PRE transforms (deterministic) BEFORE LLM
-                prepped = apply_pre_transforms(frozen, SPEC)
+            # Trim oversized HTML for prompt resilience
+            prepped = frozen
+            if len(prepped) > MAX_INPUT_CHARS:
+                prepped = prepped[:MAX_INPUT_CHARS] + "\n<!-- truncated for prompt -->"
 
-                # Trim oversized HTML for prompt resilience
-                if len(prepped) > MAX_INPUT_CHARS:
-                    prepped = prepped[:MAX_INPUT_CHARS] + "\n<!-- truncated for prompt -->"
-
-                # Call OpenAI with chosen models, model reference & hard rules (SPEC)
-                try:
-                    rewritten = openai_rewrite(
-                        user_request=user_request,
-                        html=prepped,
-                        dt_mode=dt_mode,
-                        policy_hard_rules=SPEC,
-                        model_html_skeleton=model_html_skeleton,
-                        model_image_data_url=model_image_data_url,
-                        model_text_id=MODEL_TEXT,
-                        model_vision_id=MODEL_VISION,
-                    )
-                except Exception as e:
-                    st.error(f"Rewrite failed for [{meta.get('title') or meta.get('url')}] — {e}")
-                    progress.progress(n / total)
-                    # Keep an entry (original as draft) so user can still preview/decide
-                    key = f"{meta['kind']}:{meta['id']}"
-                    st.session_state["items"].append({
-                        "key": key,
-                        "title": meta.get("title") or meta.get("url"),
-                        "kind": meta["kind"],
-                        "module": getattr(module, "name", ""),
-                        "item": it,
-                        "original": original,
-                        "draft": original,
-                    })
-                    st.session_state["drafts"][key] = {"diff": html_diff(original, original)}
-                    # ETA update
-                    duration = time.time() - item_t0
-                    recent_durations.append(duration)
-                    if len(recent_durations) > WINDOW:
-                        recent_durations.pop(0)
-                    avg_item = (sum(recent_durations) / len(recent_durations)) if recent_durations else max(0.1, (time.time() - start_time) / n)
-                    remaining = total - n
-                    eta_sec = remaining * avg_item
-                    elapsed = time.time() - start_time
-                    eta_box.info(
-                        f"Processed {n}/{total} items · Elapsed {_format_duration(elapsed)} · "
-                        f"Avg/Item {avg_item:.1f}s · ETA {_format_duration(eta_sec)}"
-                    )
-                    continue
-
-                # POST transforms (deterministic) AFTER LLM
-                rewritten_no_new_iframes = strip_new_iframes(rewritten)
-                restored = restore_iframes(rewritten_no_new_iframes, mapping)
-                final_html = apply_post_transforms(restored, SPEC)
-
-                diff_html = html_diff(original, final_html)
+            # Call OpenAI with precision directives + examples
+            try:
+                rewritten = openai_rewrite(
+                    user_request=user_request,
+                    html=prepped,
+                    dt_mode=dt_mode,
+                    precision_directives=precision_directives,
+                    model_html_skeleton=model_html_skeleton,
+                    model_image_data_url=model_image_data_url,
+                    model_text_id=MODEL_TEXT,
+                    model_vision_id=MODEL_VISION,
+                )
+            except Exception as e:
+                st.error(f"Rewrite failed for [{meta.get('title') or meta.get('url')}] — {e}")
+                progress.progress(n / total)
                 key = f"{meta['kind']}:{meta['id']}"
                 st.session_state["items"].append({
                     "key": key,
@@ -1138,11 +753,10 @@ if courses:
                     "module": getattr(module, "name", ""),
                     "item": it,
                     "original": original,
-                    "draft": final_html,
+                    "draft": original,
                 })
-                st.session_state["drafts"][key] = {"diff": diff_html}
-
-                # --- update ETA/progress UI ---
+                st.session_state["drafts"][key] = {"diff": html_diff(original, original)}
+                # ETA update
                 duration = time.time() - item_t0
                 recent_durations.append(duration)
                 if len(recent_durations) > WINDOW:
@@ -1155,31 +769,61 @@ if courses:
                     f"Processed {n}/{total} items · Elapsed {_format_duration(elapsed)} · "
                     f"Avg/Item {avg_item:.1f}s · ETA {_format_duration(eta_sec)}"
                 )
-                progress.progress(n / total)
+                continue
 
-            st.success(f"Prepared {len(st.session_state['items'])} items.")
+            # Strip any new iframes, then restore originals
+            rewritten_no_new_iframes = strip_new_iframes(rewritten)
+            final_html = restore_iframes(rewritten_no_new_iframes, mapping)
+
+            diff_html = html_diff(original, final_html)
+            key = f"{meta['kind']}:{meta['id']}"
+            st.session_state["items"].append({
+                "key": key,
+                "title": meta.get("title") or meta.get("url"),
+                "kind": meta["kind"],
+                "module": getattr(module, "name", ""),
+                "item": it,
+                "original": original,
+                "draft": final_html,
+            })
+            st.session_state["drafts"][key] = {"diff": diff_html}
+
+            # --- update ETA/progress UI ---
+            duration = time.time() - item_t0
+            recent_durations.append(duration)
+            if len(recent_durations) > WINDOW:
+                recent_durations.pop(0)
+            avg_item = (sum(recent_durations) / len(recent_durations)) if recent_durations else max(0.1, (time.time() - start_time) / n)
+            remaining = total - n
+            eta_sec = remaining * avg_item
+            elapsed = time.time() - start_time
+            eta_box.info(
+                f"Processed {n}/{total} items · Elapsed {_format_duration(elapsed)} · "
+                f"Avg/Item {avg_item:.1f}s · ETA {_format_duration(eta_sec)}"
+            )
+            progress.progress(n / total)
+
+        st.success(f"Prepared {len(st.session_state['items'])} items.")
 
     items = st.session_state.get("items", [])
     if items:
         st.subheader("3) Review visual previews, diffs & approve")
 
-        # Bulk approval controls
+        # Bulk toggles
         col1, col2, col3 = st.columns([1,1,3])
         with col1:
             if st.button("Approve All"):
                 for rec in items:
-                    cb_key = f"approve_{rec['key']}"
-                    st.session_state[cb_key] = True
+                    st.session_state[f"approve_{rec['key']}"] = True
         with col2:
             if st.button("Unapprove All"):
                 for rec in items:
-                    cb_key = f"approve_{rec['key']}"
-                    st.session_state[cb_key] = False
+                    st.session_state[f"approve_{rec['key']}"] = False
         with col3:
             approved_count = sum(1 for rec in items if st.session_state.get(f"approve_{rec['key']}", False))
             st.write(f"Approved: **{approved_count} / {len(items)}**")
 
-        # Render each item
+        # Render items
         for _, rec in enumerate(items):
             cb_key = f"approve_{rec['key']}"
             with st.expander(f"[{rec['kind']}] {rec['title']} — {rec['module']}"):
@@ -1196,7 +840,7 @@ if courses:
                     proposed_doc = preview_html_document(proposed_preview, use_js_shim=PREVIEW_JS)
                     st.components.v1.html(proposed_doc, height=PREVIEW_HEIGHT, scrolling=True)
 
-                st.markdown("**Diff (proposed vs original)**  \n_Green = insertions, Red = deletions_", help="Generated by diff-match-patch")
+                st.markdown("**Diff (proposed vs original)**  \n_Green = insertions, Red = deletions_")
                 st.components.v1.html(st.session_state["drafts"][rec["key"]]["diff"], height=240, scrolling=True)
 
                 approved = st.checkbox("Approve this item", key=cb_key, value=st.session_state.get(cb_key, False))
